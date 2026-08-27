@@ -27,11 +27,11 @@ Conway's Game of Life on a bouncing 3D cube for the LilyGo T5 4.7" e-paper panel
 
 - **`life_cube_epd/life_cube_epd.ino`:** Main sketch. 1536 cells (6 cube faces, 16×16 each). Rotating on three incommensurate axes, bouncing, reseed on stagnation or button press. Runs at 20.1 fps.
   - Motion: same drift velocity always, walls suspend per-axis when off-panel (so a diagonal exit doesn't trap the cube on re-entry). Exit/wipe/enter sequence uses ordinary animation speed.
-  - Button support: all three panel buttons (GPIO 34/35/39) are active-low with external pull-ups; probed at boot and dropped if they don't hold high. Presses are debounced 40 ms, edge-triggered.
+  - Button support: all three panel buttons (GPIO 34/35/39) are active-low with external pull-ups; probed at boot and dropped if they don't hold high. Presses are debounced 40 ms, edge-triggered. Buttons 1 and 2 end the run and reseed; button 3 (GPIO 39, `REFRESH_BUTTON`) runs an immediate de-ghost instead and leaves the run going.
 
 - **`libraries/EpdFast/`:** Custom driver wrapping LilyGo-EPD47's low-level API. Main entry point: `epd_push_diff(y0, rows, cur, prev, relight, dwell)`. Carries both `0b01` and `0b10` drive codes per pixel in a single waveform pass.
   - `epd_wipe(hold, dark_settle, light_settle, dwell)`: Bayer dissolve to black and back, then settling passes. The dissolve is 64 dither levels × hold passes per level; `hold=2` is ~5.2 s.
-  - `epd_deghost(cycles, dark_passes, light_passes, dwell)`: the same swing done as floods rather than a dissolve, so it reads as a flash. `(1, 0, 12)` is the white-only reseed clear, measured at 0.2 s.
+  - `epd_deghost(cycles, dark_passes, light_passes, dwell)`: the same swing done as floods rather than a dissolve, so it reads as a flash. Used two ways here — `(1, 0, 12)` is the white-only reseed clear (0.2 s), `(2, 4, 10)` is the button's de-ghost (541 ms).
 
 - **`libraries/LilyGo-EPD47/`:** Vendored, patched (see file headers for `LOCAL PATCH` markers). Do not replace with a fresh clone — the patches will be lost.
   - Patched files: `src/ed047tc1.c`, `src/i2s_data_bus.c`, `src/rmt_pulse.c` (IDF-5 porting, register I2S enabling, APLL ordering).
@@ -49,8 +49,13 @@ Serial output at 115200 baud. On each reseed, a line reports:
 gen=<generation> live=<cell_count> reason=<died-out|cycle-detected|max-generations|button> | <frames> frames, <fps> fps (render <ms> ms, push <ms> ms) | exit <s>s wipe <s>s enter <s>s
 ```
 
+Pressing the refresh button logs its own line:
+```
+refresh: <ms> ms at gen=<generation> live=<cell_count>
+```
+
 - `fps` is *only* on-panel frames, excluding transit (exit + wipe + enter). Transit frames are discarded from the average.
-- `reason=button` means a user press ended the run.
+- `reason=button` means a button 1/2 press ended the run. Button 3 never ends a run; it logs a `refresh:` line instead.
 - Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms.
 
 ## Working in this repo
@@ -63,7 +68,7 @@ gen=<generation> live=<cell_count> reason=<died-out|cycle-detected|max-generatio
 
 - **`WHITE_ONLY_REFRESH` decides what the reseed clear is.** At `1` (current) the reseed is a white-only flood, 0.2 s instead of 5.2 s, and the Bayer dissolve is used only at boot. At `0` the dissolve comes back for reseeds too. Boot always takes the full black-and-back wipe whatever the flag says: it has no idea what the previous sketch left on the panel.
 
-- **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The driver's own comment predicts it: lightening without first swinging black leaves the particles part-packed, so the spent cube shows through.
+- **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The driver's own comment predicts it: lightening without first swinging black leaves the particles part-packed, so the spent cube shows through. The refresh button is the counterweight and is the only full reset left; the two are a pair, and changing one without thinking about the other is how the panel ends up grey.
 
 - **The dissolve is slow on purpose.** Its 5.2 s is not tunable down without losing the effect - see finding 4. If you want a faster reseed, raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, or set `WHITE_ONLY_REFRESH`; do not shorten the dissolve.
 

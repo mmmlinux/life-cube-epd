@@ -81,6 +81,11 @@
 // through. Boot keeps the full wipe either way: it has no idea what the
 // previous sketch left on the panel, and that is the one clear that most needs
 // a real reset.
+//
+// With this on, nothing during a run ever swings the panel fully black, so
+// ghosting accumulates across reseeds with no bounded recovery. The refresh
+// button (see REFRESH_BUTTON) is the counterweight: it becomes the only full
+// reset left, for when the build-up starts to bother you.
 #define WHITE_ONLY_REFRESH   (1)
 #define WHITE_REFRESH_PASSES (12)   // full-screen lighten passes; measures 0.2 s
 
@@ -643,6 +648,11 @@ static float animate_frame(void)
 #define BUTTON_DEBOUNCE_MS (40)
 #define BUTTON_PROBE_MS    (120)
 
+// Index into BUTTON_PINS of the button that runs an immediate de-ghost instead
+// of ending the run. 2 is GPIO 39, which buttons_begin() logs as "button 3".
+// The other two still force a reseed.
+#define REFRESH_BUTTON     (2)
+
 static const int BUTTON_PINS[BUTTON_COUNT] = { BUTTON_1, BUTTON_2, BUTTON_3 };
 static bool      s_btn_ok[BUTTON_COUNT];
 static uint8_t   s_btn_level[BUTTON_COUNT];
@@ -675,12 +685,12 @@ static void buttons_begin(void)
     }
 }
 
-// True on the poll where a usable button goes down. Only called from loop(), so
-// a press during a transit is discarded rather than queued - the cycle it would
-// ask for is the one already playing.
-static bool button_pressed(void)
+// Bitmask of the usable buttons that went down on this poll, bit i for
+// BUTTON_PINS[i]. One bool could not tell the three apart, and they no longer
+// all mean the same thing.
+static uint32_t buttons_went_down(void)
 {
-    bool hit = false;
+    uint32_t hits = 0;
     const uint32_t now = millis();
     for (int i = 0; i < BUTTON_COUNT; i++) {
         if (!s_btn_ok[i]) {
@@ -696,10 +706,10 @@ static bool button_pressed(void)
         s_btn_edge_ms[i] = now;
         s_btn_level[i] = level;
         if (level == LOW) {
-            hit = true;
+            hits |= 1u << i;
         }
     }
-    return hit;
+    return hits;
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +869,45 @@ static void wipe_panel(bool full)
     s_debt_rows = 0;   // the wipe paid off everything outstanding
 }
 
+// ---------------------------------------------------------------------------
+// On-demand de-ghost
+//
+// A refresh where the cube stands, without ending the run. The reseed clear is
+// a dissolve because it is scenery; this one is a repair someone asked for, so
+// it wants to be over quickly - flood passes rather than a dithered dissolve,
+// swinging the whole panel black and back twice.
+//
+// Life, the cube's position and its spin all carry straight on; only the panel
+// changes. The next frame then redraws from a white s_shown, so it is one
+// full-band push rather than a narrow diff - a single expensive frame landing
+// in the current fps window. One frame in thousands does not move the average,
+// so the counters are deliberately left running rather than reset: throwing the
+// window away would cost more than the frame does.
+// ---------------------------------------------------------------------------
+// 2 x (4 darken + 10 lighten) = 28 flood passes, which measures 541 ms.
+#define REFRESH_CYCLES       (2)
+#define REFRESH_DARK_PASSES  (4)
+#define REFRESH_LIGHT_PASSES (10)
+
+static void refresh_now(void)
+{
+    const uint32_t t0 = millis();
+    epd_deghost(REFRESH_CYCLES, REFRESH_DARK_PASSES, REFRESH_LIGHT_PASSES, DWELL);
+
+    // The panel holds nothing now, so the next diff has to redraw the lot: say
+    // so, and drop the debt the flood just paid off.
+    r1_clear(s_shown, false);
+    s_debt_rows = 0;
+
+    // The flash ate a chunk of wall clock. Without this the next frame would
+    // integrate that gap as elapsed time and jump the cube several pixels.
+    s_last_frame_us = 0;
+
+    Serial.printf("refresh: %lu ms at gen=%lu live=%d\n",
+                  (unsigned long)(millis() - t0),
+                  (unsigned long)s_generation, live_cells());
+}
+
 static void reset_life(void)
 {
     seed_grid(SEED_DENSITY_PCT);
@@ -921,9 +970,15 @@ void setup(void)
 
 void loop(void)
 {
-    // Life still advances on its own clock either way; the button only decides
-    // whether this run is over.
-    const bool forced = button_pressed();
+    // Life still advances on its own clock whatever the buttons do. They only
+    // decide whether the panel gets a clean-up, or whether this run is over.
+    // refresh_now() zeroes s_last_frame_us and nothing between here and
+    // animate_frame() reads it, so the flash stays out of the cube's motion.
+    const uint32_t hits = buttons_went_down();
+    if (hits & (1u << REFRESH_BUTTON)) {
+        refresh_now();
+    }
+    const bool forced = (hits & ~(1u << REFRESH_BUTTON)) != 0;
     const bool finished = life_tick();
 
     if (forced || finished) {
