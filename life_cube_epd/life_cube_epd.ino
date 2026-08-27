@@ -93,10 +93,17 @@
 // Cube geometry / projection
 //
 // Model cube spans [-1,1]^3, camera at +Z distance CAM_D looking at the origin.
-// Sweeping orientations on the host puts the worst-case projected corner at
-// max |X/(CAM_D-Z)| = 0.4804, so the cube never reaches further than
-// 0.4804 * PROJ_SCALE from its centre. That constant depends only on the unit
-// cube and CAM_D, so it carries over from the colour version unchanged.
+// Maximising |X/(CAM_D-Z)| over a corner of that cube as it rotates - i.e. over
+// the sphere of radius sqrt(3) - gives sqrt(39)/13 = 0.4804, so the projection
+// never reaches further than 0.4804 * PROJ_SCALE from the centre whatever the
+// orientation. It depends only on the unit cube and CAM_D.
+//
+// The walls no longer use it: cube_extent() measures the silhouette the cube
+// actually has this frame, which at identity orientation is 103.3 px against
+// this 148.9 px bound. What is left for CUBE_RADIUS is OFFSTAGE, where the
+// worst case is the right answer - the cube keeps spinning once it is off the
+// panel, and a face-on exit that later turns corner-on must not reappear after
+// the wipe has run - and seeding the walls before the first frame is drawn.
 // ---------------------------------------------------------------------------
 #define CAM_D       (4.0f)
 #define PROJ_SCALE  (310.0f)
@@ -151,6 +158,62 @@ static uint32_t s_generation = 0;
 
 static float s_pos_x, s_pos_y, s_vel_x, s_vel_y;
 static float s_ang_x = 0.0f, s_ang_y = 0.0f, s_ang_z = 0.0f;
+
+// This frame's orientation, R = Rz * Ry * Rx. Built once by update_motion() and
+// read by both the silhouette measurement and render_cube().
+static float s_R[3][3];
+
+// This frame's projected half-extents, and the walls that follow from them.
+// Seeded with the worst case over all orientations so that place_offstage(),
+// which runs before any frame has been drawn, still has sane limits.
+static float s_half_x = CUBE_RADIUS, s_half_y = CUBE_RADIUS;
+static float s_wall_lo_x = CUBE_RADIUS + EDGE_MAX;
+static float s_wall_hi_x = EPD_WIDTH  - CUBE_RADIUS - EDGE_MAX;
+static float s_wall_lo_y = CUBE_RADIUS + EDGE_MAX;
+static float s_wall_hi_y = EPD_HEIGHT - CUBE_RADIUS - EDGE_MAX;
+
+static void update_orientation(void)
+{
+    const float cx = cosf(s_ang_x), sx = sinf(s_ang_x);
+    const float cy = cosf(s_ang_y), sy = sinf(s_ang_y);
+    const float cz = cosf(s_ang_z), sz = sinf(s_ang_z);
+
+    s_R[0][0] = cz * cy; s_R[0][1] = cz * sy * sx - sz * cx; s_R[0][2] = cz * sy * cx + sz * sx;
+    s_R[1][0] = sz * cy; s_R[1][1] = sz * sy * sx + cz * cx; s_R[1][2] = sz * sy * cx - cz * sx;
+    s_R[2][0] = -sy;     s_R[2][1] = cy * sx;                s_R[2][2] = cy * cx;
+}
+
+// Half-width and half-height of the projected silhouette, from the cube's eight
+// corners. The perspective divide maps straight edges to straight lines and no
+// corner is ever behind the camera (Z is at most sqrt(3), against CAM_D of 4),
+// so the silhouette is exactly the convex hull of the projected corners and its
+// extremes are among them.
+//
+// This replaces CUBE_RADIUS, which is the same quantity maximised over every
+// orientation: correct, but only attained at one, so the cube used to turn
+// around as much as 46 px shy of the edge.
+static void cube_extent(float *half_x, float *half_y)
+{
+    float hx = 0.0f, hy = 0.0f;
+
+    for (int c = 0; c < 8; c++) {
+        const float px = (c & 1) ? -1.0f : 1.0f;
+        const float py = (c & 2) ? -1.0f : 1.0f;
+        const float pz = (c & 4) ? -1.0f : 1.0f;
+
+        const float X = s_R[0][0] * px + s_R[0][1] * py + s_R[0][2] * pz;
+        const float Y = s_R[1][0] * px + s_R[1][1] * py + s_R[1][2] * pz;
+        const float Z = s_R[2][0] * px + s_R[2][1] * py + s_R[2][2] * pz;
+
+        const float w = PROJ_SCALE / (CAM_D - Z);
+        const float ax = fabsf(X * w), ay = fabsf(Y * w);
+        if (ax > hx) hx = ax;
+        if (ay > hy) hy = ay;
+    }
+
+    *half_x = hx;
+    *half_y = hy;
+}
 
 // Framebuffers live on the heap: two full-screen 1bpp buffers are 129,600 bytes
 // together, which overflows the static DRAM segment even though there is plenty
@@ -362,18 +425,12 @@ static void push_hash(uint32_t hash)
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+// Reads the matrix update_motion() already built for this frame, so the six
+// trig calls are paid once and the bounce test and the render always agree
+// about which way the cube is facing.
 static void render_cube(void)
 {
-    // R = Rz * Ry * Rx
-    const float cx = cosf(s_ang_x), sx = sinf(s_ang_x);
-    const float cy = cosf(s_ang_y), sy = sinf(s_ang_y);
-    const float cz = cosf(s_ang_z), sz = sinf(s_ang_z);
-
-    const float R[3][3] = {
-        { cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx },
-        { sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx },
-        { -sy,     cy * sx,                cy * cx                },
-    };
+    const float (*R)[3] = s_R;
 
     // Light roughly over the viewer's shoulder.
     const float lx = 0.35f, ly = -0.45f, lz = 0.82f;
@@ -575,11 +632,6 @@ typedef enum {
 
 static RunPhase s_phase = RUN_ON_PANEL;
 
-static const float BOUNCE_LO_X = CUBE_RADIUS + EDGE_MAX;
-static const float BOUNCE_HI_X = EPD_WIDTH  - CUBE_RADIUS - EDGE_MAX;
-static const float BOUNCE_LO_Y = CUBE_RADIUS + EDGE_MAX;
-static const float BOUNCE_HI_Y = EPD_HEIGHT - CUBE_RADIUS - EDGE_MAX;
-
 static void update_motion(float dt)
 {
     s_ang_x += SPIN_X_RAD_S * dt;
@@ -589,22 +641,32 @@ static void update_motion(float dt)
     if (s_ang_y > (float)TWO_PI) s_ang_y -= (float)TWO_PI;
     if (s_ang_z > (float)TWO_PI) s_ang_z -= (float)TWO_PI;
 
+    // The walls follow the silhouette, so the new orientation has to be
+    // resolved before they can be tested. render_cube() reuses the matrix.
+    update_orientation();
+    cube_extent(&s_half_x, &s_half_y);
+    s_wall_lo_x = s_half_x + EDGE_MAX;
+    s_wall_hi_x = EPD_WIDTH  - s_half_x - EDGE_MAX;
+    s_wall_lo_y = s_half_y + EDGE_MAX;
+    s_wall_hi_y = EPD_HEIGHT - s_half_y - EDGE_MAX;
+
     s_pos_x += s_vel_x * dt;
     s_pos_y += s_vel_y * dt;
 
-    // The cube is positioned by its centre and never projects further than
-    // CUBE_RADIUS from it, so the bounce limits come straight from that.
+    // The limits come from the cube's actual silhouette rather than its
+    // worst-case radius, so they move as it tumbles. The bounce itself is the
+    // plain one it always was: cross the wall, get put back on it, reverse.
     if (s_free_x) {
-        if (s_phase == RUN_ARRIVING && s_pos_x >= BOUNCE_LO_X && s_pos_x <= BOUNCE_HI_X) s_free_x = false;
+        if (s_phase == RUN_ARRIVING && s_pos_x >= s_wall_lo_x && s_pos_x <= s_wall_hi_x) s_free_x = false;
     } else {
-        if (s_pos_x < BOUNCE_LO_X) { s_pos_x = BOUNCE_LO_X; s_vel_x = -s_vel_x; }
-        if (s_pos_x > BOUNCE_HI_X) { s_pos_x = BOUNCE_HI_X; s_vel_x = -s_vel_x; }
+        if (s_pos_x < s_wall_lo_x) { s_pos_x = s_wall_lo_x; s_vel_x = -s_vel_x; }
+        if (s_pos_x > s_wall_hi_x) { s_pos_x = s_wall_hi_x; s_vel_x = -s_vel_x; }
     }
     if (s_free_y) {
-        if (s_phase == RUN_ARRIVING && s_pos_y >= BOUNCE_LO_Y && s_pos_y <= BOUNCE_HI_Y) s_free_y = false;
+        if (s_phase == RUN_ARRIVING && s_pos_y >= s_wall_lo_y && s_pos_y <= s_wall_hi_y) s_free_y = false;
     } else {
-        if (s_pos_y < BOUNCE_LO_Y) { s_pos_y = BOUNCE_LO_Y; s_vel_y = -s_vel_y; }
-        if (s_pos_y > BOUNCE_HI_Y) { s_pos_y = BOUNCE_HI_Y; s_vel_y = -s_vel_y; }
+        if (s_pos_y < s_wall_lo_y) { s_pos_y = s_wall_lo_y; s_vel_y = -s_vel_y; }
+        if (s_pos_y > s_wall_hi_y) { s_pos_y = s_wall_hi_y; s_vel_y = -s_vel_y; }
     }
 }
 
@@ -626,9 +688,11 @@ static float animate_frame(void)
         dt = 0.5f;   // a long stall - don't teleport the cube
     }
 
-    update_motion(dt);
-
+    // update_motion() is inside the timed region: it now carries the six trig
+    // calls and the silhouette measurement, and timing only render_cube() would
+    // show that work as a saving rather than a cost.
     uint32_t t = micros();
+    update_motion(dt);
     render_cube();
     s_render_us += micros() - t;
 
@@ -696,11 +760,9 @@ static void buttons_begin(void)
 }
 
 // Bitmask of the usable buttons that went down on this poll, bit i for
-// BUTTON_PINS[i]. One bool could not tell the three apart, and they no longer
-// all mean the same thing. Called once a frame from loop(), which runs in every
-// phase, so the only windows where a press can fall down the gap are the
-// clears: epd_wipe() and epd_deghost() block inside the library with no
-// callback.
+// BUTTON_PINS[i]. Called once a frame from loop(), which runs in every phase,
+// so the only windows where a press can fall down the gap are the clears:
+// epd_wipe() and epd_deghost() block inside the library with no callback.
 static uint32_t buttons_went_down(void)
 {
     uint32_t hits = 0;
@@ -837,11 +899,11 @@ static void wrap_to_far_side(void)
 {
     if      (s_pos_x < -OFFSTAGE)              { s_pos_x = EPD_WIDTH + OFFSTAGE; s_free_x = true; }
     else if (s_pos_x > EPD_WIDTH + OFFSTAGE)   { s_pos_x = -OFFSTAGE;            s_free_x = true; }
-    else    { s_pos_x = clampf(s_pos_x, BOUNCE_LO_X, BOUNCE_HI_X); s_free_x = false; }
+    else    { s_pos_x = clampf(s_pos_x, s_wall_lo_x, s_wall_hi_x); s_free_x = false; }
 
     if      (s_pos_y < -OFFSTAGE)              { s_pos_y = EPD_HEIGHT + OFFSTAGE; s_free_y = true; }
     else if (s_pos_y > EPD_HEIGHT + OFFSTAGE)  { s_pos_y = -OFFSTAGE;             s_free_y = true; }
-    else    { s_pos_y = clampf(s_pos_y, BOUNCE_LO_Y, BOUNCE_HI_Y); s_free_y = false; }
+    else    { s_pos_y = clampf(s_pos_y, s_wall_lo_y, s_wall_hi_y); s_free_y = false; }
 }
 
 // Boot has no previous exit to come back from, so the first cube is simply
@@ -854,7 +916,7 @@ static void place_offstage(void)
     s_vel_y = (esp_random() & 1) ? DRIFT_Y_PX_S : -DRIFT_Y_PX_S;
 
     s_pos_x = (s_vel_x > 0.0f) ? -OFFSTAGE : (EPD_WIDTH + OFFSTAGE);
-    s_pos_y = BOUNCE_LO_Y + (BOUNCE_HI_Y - BOUNCE_LO_Y)
+    s_pos_y = s_wall_lo_y + (s_wall_hi_y - s_wall_lo_y)
                           * ((esp_random() % 1000) / 1000.0f);
     s_free_x = true;    // drifting in
     s_free_y = false;   // already in range, so its wall is live

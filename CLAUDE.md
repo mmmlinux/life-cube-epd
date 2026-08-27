@@ -27,8 +27,10 @@ Conway's Game of Life on a bouncing 3D cube for the LilyGo T5 4.7" e-paper panel
 
 - **`life_cube_epd/life_cube_epd.ino`:** Main sketch. 1536 cells (6 cube faces, 16×16 each). Rotating on three incommensurate axes, bouncing, reseed on stagnation or button press. Runs at 20.1 fps.
   - Motion: same drift velocity always, walls suspend per-axis when off-panel (so a diagonal exit doesn't trap the cube on re-entry). Exit/wipe/enter sequence uses ordinary animation speed.
+  - Bouncing uses the cube's **actual** projected silhouette, not a bounding radius. `update_motion()` builds the frame's rotation matrix into `s_R`, `cube_extent()` takes the max over the 8 projected corners, and the four `s_wall_*` limits follow. `render_cube()` reads the same `s_R`, so the trig is paid once and the bounce and the render always agree. Costs **4.78 µs/frame**, measured — 0.01% of a ~50 ms frame.
+  - `CUBE_RADIUS` (0.4804 × `PROJ_SCALE` = 149 px, i.e. √39/13, the worst case over all orientations) survives for `OFFSTAGE` — where worst case is correct, since a face-on exit could rotate corner-on and reappear after the wipe — and to seed `s_wall_*` before the first frame.
   - Button support: all three panel buttons (GPIO 34/35/39) are active-low with external pull-ups; probed at boot and dropped if they don't hold high. Presses are debounced 40 ms, edge-triggered. Buttons 1 and 2 end the run and reseed; button 3 (GPIO 39, `REFRESH_BUTTON`) runs an immediate de-ghost instead and leaves the run going.
-  - The reseed cycle is a three-phase state machine (`RunPhase`: `RUN_ON_PANEL` / `RUN_LEAVING` / `RUN_ARRIVING`), driven entirely from `loop()`. There are no nested frame loops — `loop()` runs once per frame in every phase and `animate_frame()` is called from exactly one place. `update_motion()` reads `s_phase == RUN_ARRIVING` to know whether a suspended axis may reclaim its wall.
+  - The reseed cycle is a three-phase state machine (`RunPhase`: `RUN_ON_PANEL` / `RUN_LEAVING` / `RUN_ARRIVING`), driven entirely from `loop()`. There are no nested frame loops — `loop()` runs once per frame in every phase and `animate_frame()` is called from exactly one place. The phase decides only whether the walls are live and what happens when the cube reaches its mark; `update_motion()` reads `s_phase == RUN_ARRIVING` to know whether a suspended axis may reclaim its wall.
   - Because `loop()` always runs, buttons are polled there once a frame and a refresh needs no latch. The only windows where a press is missed are the clears, which block inside the library.
   - A run's figures are snapshotted into `s_run` when it ends and printed once the next cube has arrived, so the transit timings on the line belong to the transit that just happened. `s_run.pending` is false at boot, where there is an arrival but no run behind it to report.
 
@@ -52,16 +54,18 @@ Serial output at 115200 baud. On each reseed, a line reports:
 gen=<generation> live=<cell_count> reason=<died-out|cycle-detected|max-generations|button> | <frames> frames, <fps> fps (render <ms> ms, push <ms> ms) | exit <s>s wipe <s>s enter <s>s
 ```
 
-Pressing the refresh button logs its own line:
+Pressing the refresh button logs its own line, wherever it happened:
 ```
 refresh: <ms> ms at gen=<generation> live=<cell_count>
 ```
 
+- `render` covers `update_motion()` **and** `render_cube()`. The trig moved into the former with the exact-bounds change, and timing only the latter would have shown that work as a saving rather than a cost.
+- `render` cannot resolve small changes: it swings ~800 µs (3.1–3.9 ms observed) with live-cell count alone. Anything smaller needs a direct micro-benchmark — that is how the 4.78 µs figure above was taken.
 - `fps` is *only* on-panel frames, excluding transit (exit + wipe + enter). The counters are zeroed on every `RUN_ARRIVING` → `RUN_ON_PANEL` transition, boot's arrival included, so the first reported window is on-panel too. (Before the state machine, boot's ~9 s of drifting on landed in the first window and made its `fps` read high.)
-- `enter` takes one of two values, set by which axis has to come back into range: the cube always covers `BOUNCE_LO + OFFSTAGE` = 310.85 px to arrive, so a horizontal arrival is 310.85/34 = **9.1 s** and a vertical one is 310.85/16 = **19.4 s**. Measured 9.2 s and 19.5 s. Side arrivals dominate because the horizontal drift is twice the vertical. `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
-- `exit` and `enter` are wall clock across the transit phases, measured from `s_phase_t0`, so a refresh taken mid-transit is included in them. Deliberate — the figure is what the transit actually took.
 - `reason=button` means a button 1/2 press ended the run. Button 3 never ends a run; it logs a `refresh:` line instead.
-- Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms.
+- `exit` and `enter` are wall clock across the transit phases, measured from `s_phase_t0`, so a refresh taken mid-transit is included in them. Deliberate — the figure is what the transit actually took.
+- `enter` takes one of two values, set by which axis has to come back into range: the cube always covers `BOUNCE_LO + OFFSTAGE` = 310.85 px to arrive, so a horizontal arrival is 310.85/34 = **9.1 s** and a vertical one is 310.85/16 = **19.4 s**. Measured 9.2 s and 19.5 s. Side arrivals dominate because the horizontal drift is twice the vertical. `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
+- Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms — the phase is only tested once a frame, which is where the ~60 ms above the arithmetic comes from.
 
 ## Working in this repo
 
@@ -73,9 +77,11 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 
 - **`WHITE_ONLY_REFRESH` decides what the reseed clear is.** At `1` (current) the reseed is a white-only flood, 0.2 s instead of 5.2 s, and the Bayer dissolve is used only at boot. At `0` the dissolve comes back for reseeds too. Boot always takes the full black-and-back wipe whatever the flag says: it has no idea what the previous sketch left on the panel.
 
-- **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The driver's own comment predicts it: lightening without first swinging black leaves the particles part-packed, so the spent cube shows through. The refresh button is the counterweight and is the only full reset left; the two are a pair, and changing one without thinking about the other is how the panel ends up grey.
+- **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The refresh button is the counterweight and is the only full reset left. The two are a pair; changing one without thinking about the other is how the panel ends up grey.
 
 - **The dissolve is slow on purpose.** Its 5.2 s is not tunable down without losing the effect - see finding 4. If you want a faster reseed, raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, or set `WHITE_ONLY_REFRESH`; do not shorten the dissolve.
+
+- **A refresh cannot be taken during a clear.** `epd_wipe()` and `epd_deghost()` block inside the library with no callback, so the boot dissolve (5.2 s) and the reseed wipe (0.2 s) are the two windows where a press is missed. Everything else - both transits included - polls every frame.
 
 - **Git:** All three original commits are on `main` and attributed to `mmmlinux`. The identity was rewritten after the initial port; if you see commit SHAs in old notes they no longer match.
 
