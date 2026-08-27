@@ -775,7 +775,8 @@ static void buttons_begin(void)
 // Bitmask of the usable buttons that went down on this poll, bit i for
 // BUTTON_PINS[i]. Called once a frame from loop(), which runs in every phase,
 // so the only windows where a press can fall down the gap are the clears:
-// epd_wipe() and epd_deghost() block inside the library with no callback.
+// epd_wipe(), epd_white_dissolve() and epd_deghost() all block inside the
+// library with no callback.
 static uint32_t buttons_went_down(void)
 {
     uint32_t hits = 0;

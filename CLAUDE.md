@@ -70,7 +70,23 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 - `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
 - Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms — the phase is only tested once a frame, which is where the ~60 ms above the arithmetic comes from.
 
+## Building and flashing
+
+The build line is at the top of this file. Beyond it:
+
+- **Close any serial monitor before uploading.** This is the one that wastes time. A monitor holding `/dev/cu.usbserial-*` makes `arduino-cli compile -u` fail with `A serial exception error occurred: device reports readiness to read but returned no data (device disconnected or multiple access on port?)`, and esptool's own note blames the hardware or drivers. It is neither — it is the port being open twice. Kill the reader and re-run.
+
+- **Comment-only edits do not need a reflash.** Comments never reach the binary, so a doc pass over the sketch leaves the board correct.
+
+- **Reading serial:** `arduino-cli monitor -p /dev/cu.usbserial-51850159751 -c baudrate=115200`. The system `python3` has **no pyserial**, so ad-hoc scripts need raw `termios`/`fcntl` — and must set the baud rate on the already-open fd, since opening the port resets the `stty` settings applied beforehand.
+
+- **Silence on the wire is normal.** The sketch prints at boot, on each reseed, and on each refresh press — nothing in between. Minutes of quiet mean it is running, not hung; a panic would spew continuously. Catching the boot log means resetting the board (toggle RTS to pull EN low, or press reset), because the ROM bootloader's own output is at 74880 baud and will look like line noise at 115200.
+
 ## Working in this repo
+
+- **Numbers in this file are measured on hardware, not estimated.** Keep it that way: state a figure only once the panel has produced it, and correct it when a later measurement disagrees. Several figures here have already moved that way — the reseed clear went 5.2 s → 0.2 s → 1.5 s across three changes, and `enter` stopped being a fixed 9.2 s once the walls became dynamic.
+
+- **The frame average cannot resolve small changes.** `render` swings ~800 µs with live-cell count alone, so anything below roughly a millisecond needs a temporary micro-benchmark in `setup()` — run it, read the line, then strip it before committing. That is how the 4.78 µs `cube_extent()` figure was taken.
 
 - **Do not edit the vendored driver unless absolutely necessary.** If you must patch a file in `libraries/LilyGo-EPD47/src/`, add a `/* LOCAL PATCH: ... */` comment near the change and update the file's header notice (see `ed047tc1.c` for the format). The patches are load-bearing; a fresh clone will silently revert them.
 
@@ -82,11 +98,11 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 
 - **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The refresh button is the counterweight and is the only full reset left. The two are a pair; changing one without thinking about the other is how the panel ends up grey.
 
-- **The dissolve is slow on purpose.** Its 5.2 s is not tunable down without losing the effect - see finding 4. If you want a faster reseed, raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, or set `WHITE_ONLY_REFRESH`; do not shorten the dissolve.
+- **There are two dissolves; do not confuse them.** `epd_wipe()`'s black-and-back one (`WIPE_HOLD 2`, 5.2 s, boot only) and `epd_white_dissolve()`'s white-only one (`WHITE_REFRESH_HOLD 1`, 1.5 s, every reseed). Neither is tunable down by dwell — see finding 4. For a faster reseed raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`; do not shorten a dissolve.
 
-- **A refresh cannot be taken during a clear.** `epd_wipe()` and `epd_deghost()` block inside the library with no callback, so the boot wipe (5.2 s) and the reseed dissolve (1.5 s) are the two windows where a press is missed. Everything else - both transits included - polls every frame.
+- **A refresh cannot be taken during a clear.** `epd_wipe()`, `epd_white_dissolve()` and `epd_deghost()` all block inside the library with no callback, so the boot wipe (5.2 s) and the reseed dissolve (1.5 s) are the two windows where a press is missed. Everything else — both transits included — polls every frame. Making them interruptible would mean threading a callback through the library's own row loops.
 
-- **Git:** All three original commits are on `main` and attributed to `mmmlinux`. The identity was rewritten after the initial port; if you see commit SHAs in old notes they no longer match.
+- **Git:** Everything lives on `main`. Author every commit as `Elliott Krimchansky <2261595+mmmlinux@users.noreply.github.com>` — that identity is uniform across the history and was rewritten after the initial port, so commit SHAs quoted in old notes no longer match.
 
 ## If something breaks
 
