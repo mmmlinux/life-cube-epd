@@ -74,20 +74,33 @@
 #define WIPE_DARK_SETTLE  (4)
 #define WIPE_LIGHT_SETTLE (10)
 
-// Set to 1 to swap that dissolve for a white-only flood at reseeds: no darken
-// phase at all, so ~0.2 s instead of ~5.2 s. The trade is ghosting - see
-// epd_deghost(), which notes that lightening pixels without first swinging them
-// black leaves the particles part-packed, so the spent cube is expected to show
-// through. Boot keeps the full wipe either way: it has no idea what the
-// previous sketch left on the panel, and that is the one clear that most needs
-// a real reset.
+// Set to 1 to swap that dissolve for a white-only one at reseeds: the same
+// Bayer stagger, but towards white only, with no darken half. By the time it
+// runs the panel is already blank - the cube has drifted off-frame - so the
+// only thing left to remove is the ghost it trailed, and a black flash to do
+// that is worth avoiding.
 //
-// With this on, nothing during a run ever swings the panel fully black, so
-// ghosting accumulates across reseeds with no bounded recovery. The refresh
-// button (see REFRESH_BUTTON) is the counterweight: it becomes the only full
-// reset left, for when the build-up starts to bother you.
+// Dissolved rather than flooded so the ghost fades instead of popping. A flood
+// cannot be made slower: passes past the white rail do nothing, so a longer one
+// is the same clear with idle time added. Boot keeps the full black-and-back
+// wipe either way - it has no idea what the previous sketch left on the panel,
+// and that is the one clear that most needs a real reset.
+//
+// HOLD is the duration control and wants to stay low. Unlike the black
+// dissolve, which staggers a huge contrast change, this one staggers a tiny
+// one - so the main thing on show mid-dissolve is the 8x8 dither texture
+// itself, and holding longer means more of it, not less. If the fade looks
+// patterned, raise SETTLE rather than HOLD.
+//
+// The trade is ghosting - see epd_deghost(), which notes that lightening pixels
+// without first swinging them black leaves the particles part-packed, so the
+// spent cube is expected to show through. With this on, nothing during a run
+// ever swings the panel fully black, so it accumulates across reseeds with no
+// bounded recovery. The refresh button (see REFRESH_BUTTON) is the
+// counterweight: it becomes the only full reset left.
 #define WHITE_ONLY_REFRESH   (1)
-#define WHITE_REFRESH_PASSES (12)   // full-screen lighten passes; measures 0.2 s
+#define WHITE_REFRESH_HOLD   (1)    // dissolve passes per dither level; 1 measures 1.5 s
+#define WHITE_REFRESH_SETTLE (12)   // closing lighten floods, to a common rail
 
 // ---------------------------------------------------------------------------
 // Cube geometry / projection
@@ -940,7 +953,7 @@ static void wipe_panel(bool full)
     if (full) {
         epd_wipe(WIPE_HOLD, WIPE_DARK_SETTLE, WIPE_LIGHT_SETTLE, DWELL);
     } else {
-        epd_deghost(1, 0, WHITE_REFRESH_PASSES, DWELL);   // one cycle, no darken passes
+        epd_white_dissolve(WHITE_REFRESH_HOLD, WHITE_REFRESH_SETTLE, DWELL);
     }
     s_wipe_ms = millis() - t0;
     r1_clear(s_shown, false);

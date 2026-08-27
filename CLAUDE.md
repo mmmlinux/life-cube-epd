@@ -36,7 +36,9 @@ Conway's Game of Life on a bouncing 3D cube for the LilyGo T5 4.7" e-paper panel
 
 - **`libraries/EpdFast/`:** Custom driver wrapping LilyGo-EPD47's low-level API. Main entry point: `epd_push_diff(y0, rows, cur, prev, relight, dwell)`. Carries both `0b01` and `0b10` drive codes per pixel in a single waveform pass.
   - `epd_wipe(hold, dark_settle, light_settle, dwell)`: Bayer dissolve to black and back, then settling passes. The dissolve is 64 dither levels × hold passes per level; `hold=2` is ~5.2 s.
-  - `epd_deghost(cycles, dark_passes, light_passes, dwell)`: the same swing done as floods rather than a dissolve, so it reads as a flash. Used two ways here — `(1, 0, 12)` is the white-only reseed clear (0.2 s), `(2, 4, 10)` is the button's de-ghost (541 ms).
+  - `epd_deghost(cycles, dark_passes, light_passes, dwell)`: the same swing done as floods rather than a dissolve, so it reads as a flash. `(2, 4, 10)` is the button's de-ghost, measured at 541 ms.
+  - `epd_white_dissolve(hold, light_settle, dwell)`: the lighten half of `epd_wipe()` on its own — Bayer dissolve towards white, then settling floods, no darken phase. This is the reseed clear at `WHITE_ONLY_REFRESH (1)`; `(1, 12)` measures 1.5 s. **A flood cannot be slowed** (passes past the white rail do nothing), so staggering which pixels are driven is the only control over how gradual it looks.
+  - **`hold` wants to stay low here, unlike in `epd_wipe()`.** That one staggers a black crossing — a huge contrast change. This one staggers a tiny one, so what is mostly on show mid-dissolve is the 8×8 dither texture itself, and holding longer means more exposure to it. If the fade looks patterned, raise `light_settle`, not `hold`.
 
 - **`libraries/LilyGo-EPD47/`:** Vendored, patched (see file headers for `LOCAL PATCH` markers). Do not replace with a fresh clone — the patches will be lost.
   - Patched files: `src/ed047tc1.c`, `src/i2s_data_bus.c`, `src/rmt_pulse.c` (IDF-5 porting, register I2S enabling, APLL ordering).
@@ -64,7 +66,8 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 - `fps` is *only* on-panel frames, excluding transit (exit + wipe + enter). The counters are zeroed on every `RUN_ARRIVING` → `RUN_ON_PANEL` transition, boot's arrival included, so the first reported window is on-panel too. (Before the state machine, boot's ~9 s of drifting on landed in the first window and made its `fps` read high.)
 - `reason=button` means a button 1/2 press ended the run. Button 3 never ends a run; it logs a `refresh:` line instead.
 - `exit` and `enter` are wall clock across the transit phases, measured from `s_phase_t0`, so a refresh taken mid-transit is included in them. Deliberate — the figure is what the transit actually took.
-- `enter` takes one of two values, set by which axis has to come back into range: the cube always covers `BOUNCE_LO + OFFSTAGE` = 310.85 px to arrive, so a horizontal arrival is 310.85/34 = **9.1 s** and a vertical one is 310.85/16 = **19.4 s**. Measured 9.2 s and 19.5 s. Side arrivals dominate because the horizontal drift is twice the vertical. `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
+- `enter` is set by which axis has to come back into range, and since the exact-bounds change it varies a little within that. The cube covers `s_wall_lo + OFFSTAGE` to arrive, and `s_wall_lo` now depends on the silhouette at the moment the axis reclaims its wall — 107.8 px face-on to 153.4 px corner-on. So a horizontal arrival is **7.8–9.1 s** and a vertical one **16.6–19.4 s**. Measured 8.8 s and 9.0 s horizontal; 19.5 s vertical was recorded before the walls became dynamic. Side arrivals dominate because the horizontal drift is twice the vertical.
+- `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
 - Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms — the phase is only tested once a frame, which is where the ~60 ms above the arithmetic comes from.
 
 ## Working in this repo
@@ -75,13 +78,13 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 
 - **Frame rate varies by position.** A cube near a panel edge has its diff band clipped, so frames are cheaper. A 949-frame window measured 25.0 fps; a 3281-frame window measured 20.1 fps. Long windows are more representative.
 
-- **`WHITE_ONLY_REFRESH` decides what the reseed clear is.** At `1` (current) the reseed is a white-only flood, 0.2 s instead of 5.2 s, and the Bayer dissolve is used only at boot. At `0` the dissolve comes back for reseeds too. Boot always takes the full black-and-back wipe whatever the flag says: it has no idea what the previous sketch left on the panel.
+- **`WHITE_ONLY_REFRESH` decides what the reseed clear is.** At `1` (current) the reseed is a white-only dissolve, 1.5 s instead of 5.2 s, and the full black-and-back wipe is used only at boot. At `0` the dissolve comes back for reseeds too. Boot always takes the full black-and-back wipe whatever the flag says: it has no idea what the previous sketch left on the panel.
 
 - **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The refresh button is the counterweight and is the only full reset left. The two are a pair; changing one without thinking about the other is how the panel ends up grey.
 
 - **The dissolve is slow on purpose.** Its 5.2 s is not tunable down without losing the effect - see finding 4. If you want a faster reseed, raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, or set `WHITE_ONLY_REFRESH`; do not shorten the dissolve.
 
-- **A refresh cannot be taken during a clear.** `epd_wipe()` and `epd_deghost()` block inside the library with no callback, so the boot dissolve (5.2 s) and the reseed wipe (0.2 s) are the two windows where a press is missed. Everything else - both transits included - polls every frame.
+- **A refresh cannot be taken during a clear.** `epd_wipe()` and `epd_deghost()` block inside the library with no callback, so the boot wipe (5.2 s) and the reseed dissolve (1.5 s) are the two windows where a press is missed. Everything else - both transits included - polls every frame.
 
 - **Git:** All three original commits are on `main` and attributed to `mmmlinux`. The identity was rewritten after the initial port; if you see commit SHAs in old notes they no longer match.
 

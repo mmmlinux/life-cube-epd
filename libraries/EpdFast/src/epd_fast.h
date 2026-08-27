@@ -292,6 +292,30 @@ static void epd_wipe(int hold, int dark_settle, int light_settle, uint32_t dwell
 }
 
 /*
+ * A white-only version of the same idea: dissolve towards white, then settle,
+ * with no black half at all. Used for the reseed clear, where the panel is
+ * already blank by the time it runs - the cube has drifted off-frame - and the
+ * only thing left to remove is the ghost it trailed.
+ *
+ * Dissolved rather than flooded because a flood cannot be slowed down. Pass
+ * count drives pixels to the white rail and further passes do nothing, so
+ * asking for a longer flood just bolts idle time onto the same drive. Which
+ * pixels get driven, and when, is the only control there is over how gradual it
+ * looks - see epd_push_dissolve().
+ *
+ * The closing floods are not optional. Mid-dissolve the panel holds 64
+ * different levels, because a pixel at Bayer threshold 0 is driven on all 64
+ * steps while one at 63 is driven once. Settling brings them to a common rail;
+ * without it the dither pattern prints faintly into the background, and a
+ * caller's relight would then push tracks brighter than the paper around them.
+ */
+static void epd_white_dissolve(int hold, int light_settle, uint32_t dwell) {
+  for (int s = 0; s < 64; s++)
+    for (int h = 0; h < hold; h++) epd_push_dissolve(EPD_LIGHTEN, s, dwell);
+  for (int p = 0; p < light_settle; p++) epd_push_flood(0, EPD_HEIGHT, EPD_LIGHTEN, dwell);
+}
+
+/*
  * Flush the panel to white, alternating polarity. Driving every pixel white
  * would get the screen white but leaves the particles part-packed, so old
  * images keep showing through; swinging fully black and back is what actually
