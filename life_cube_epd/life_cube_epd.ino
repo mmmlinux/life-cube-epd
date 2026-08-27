@@ -74,6 +74,16 @@
 #define WIPE_DARK_SETTLE  (4)
 #define WIPE_LIGHT_SETTLE (10)
 
+// Set to 1 to swap that dissolve for a white-only flood at reseeds: no darken
+// phase at all, so ~0.2 s instead of ~5.2 s. The trade is ghosting - see
+// epd_deghost(), which notes that lightening pixels without first swinging them
+// black leaves the particles part-packed, so the spent cube is expected to show
+// through. Boot keeps the full wipe either way: it has no idea what the
+// previous sketch left on the panel, and that is the one clear that most needs
+// a real reset.
+#define WHITE_ONLY_REFRESH   (1)
+#define WHITE_REFRESH_PASSES (12)   // full-screen lighten passes; measures 0.2 s
+
 // ---------------------------------------------------------------------------
 // Cube geometry / projection
 //
@@ -834,10 +844,16 @@ static void enter_stage(void)
     s_enter_ms = millis() - t0;
 }
 
-static void wipe_panel(void)
+// `full` picks the black-and-back dissolve over the white-only flood. Reseeds
+// follow WHITE_ONLY_REFRESH; boot always asks for the full one.
+static void wipe_panel(bool full)
 {
     const uint32_t t0 = millis();
-    epd_wipe(WIPE_HOLD, WIPE_DARK_SETTLE, WIPE_LIGHT_SETTLE, DWELL);
+    if (full) {
+        epd_wipe(WIPE_HOLD, WIPE_DARK_SETTLE, WIPE_LIGHT_SETTLE, DWELL);
+    } else {
+        epd_deghost(1, 0, WHITE_REFRESH_PASSES, DWELL);   // one cycle, no darken passes
+    }
     s_wipe_ms = millis() - t0;
     r1_clear(s_shown, false);
     s_debt_rows = 0;   // the wipe paid off everything outstanding
@@ -897,7 +913,7 @@ void setup(void)
 
     // Same staging as a reseed, minus the exit: wipe whatever the last sketch
     // left on the panel, then let the first cube drift on from off-frame.
-    wipe_panel();
+    wipe_panel(true);   // whatever the last sketch left needs a real reset
     reset_life();
     place_offstage();
     enter_stage();
@@ -929,7 +945,7 @@ void loop(void)
         const char *reason = s_last_reason;
 
         exit_stage();       // carries on exactly as it was until it is off-panel
-        wipe_panel();
+        wipe_panel(!WHITE_ONLY_REFRESH);
         reset_life();
         wrap_to_far_side();
         enter_stage();      // and drifts back on, already running

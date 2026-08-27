@@ -31,6 +31,7 @@ Conway's Game of Life on a bouncing 3D cube for the LilyGo T5 4.7" e-paper panel
 
 - **`libraries/EpdFast/`:** Custom driver wrapping LilyGo-EPD47's low-level API. Main entry point: `epd_push_diff(y0, rows, cur, prev, relight, dwell)`. Carries both `0b01` and `0b10` drive codes per pixel in a single waveform pass.
   - `epd_wipe(hold, dark_settle, light_settle, dwell)`: Bayer dissolve to black and back, then settling passes. The dissolve is 64 dither levels × hold passes per level; `hold=2` is ~5.2 s.
+  - `epd_deghost(cycles, dark_passes, light_passes, dwell)`: the same swing done as floods rather than a dissolve, so it reads as a flash. `(1, 0, 12)` is the white-only reseed clear, measured at 0.2 s.
 
 - **`libraries/LilyGo-EPD47/`:** Vendored, patched (see file headers for `LOCAL PATCH` markers). Do not replace with a fresh clone — the patches will be lost.
   - Patched files: `src/ed047tc1.c`, `src/i2s_data_bus.c`, `src/rmt_pulse.c` (IDF-5 porting, register I2S enabling, APLL ordering).
@@ -60,7 +61,11 @@ gen=<generation> live=<cell_count> reason=<died-out|cycle-detected|max-generatio
 
 - **Frame rate varies by position.** A cube near a panel edge has its diff band clipped, so frames are cheaper. A 949-frame window measured 25.0 fps; a 3281-frame window measured 20.1 fps. Long windows are more representative.
 
-- **The clear is slow on purpose.** The 5.2 s dissolve is not tunable down without losing the effect. If you want a faster reseed, increase `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, not the clear.
+- **`WHITE_ONLY_REFRESH` decides what the reseed clear is.** At `1` (current) the reseed is a white-only flood, 0.2 s instead of 5.2 s, and the Bayer dissolve is used only at boot. At `0` the dissolve comes back for reseeds too. Boot always takes the full black-and-back wipe whatever the flag says: it has no idea what the previous sketch left on the panel.
+
+- **With `WHITE_ONLY_REFRESH (1)`, nothing during a run swings the panel fully black,** so ghosting accumulates across reseeds with no bounded recovery. The driver's own comment predicts it: lightening without first swinging black leaves the particles part-packed, so the spent cube shows through.
+
+- **The dissolve is slow on purpose.** Its 5.2 s is not tunable down without losing the effect - see finding 4. If you want a faster reseed, raise `GENERATION_INTERVAL_MS` or lower `MAX_GENERATIONS_NO_LOOP`, or set `WHITE_ONLY_REFRESH`; do not shorten the dissolve.
 
 - **Git:** All three original commits are on `main` and attributed to `mmmlinux`. The identity was rewritten after the initial port; if you see commit SHAs in old notes they no longer match.
 
