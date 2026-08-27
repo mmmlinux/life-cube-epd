@@ -28,6 +28,9 @@ Conway's Game of Life on a bouncing 3D cube for the LilyGo T5 4.7" e-paper panel
 - **`life_cube_epd/life_cube_epd.ino`:** Main sketch. 1536 cells (6 cube faces, 16×16 each). Rotating on three incommensurate axes, bouncing, reseed on stagnation or button press. Runs at 20.1 fps.
   - Motion: same drift velocity always, walls suspend per-axis when off-panel (so a diagonal exit doesn't trap the cube on re-entry). Exit/wipe/enter sequence uses ordinary animation speed.
   - Button support: all three panel buttons (GPIO 34/35/39) are active-low with external pull-ups; probed at boot and dropped if they don't hold high. Presses are debounced 40 ms, edge-triggered. Buttons 1 and 2 end the run and reseed; button 3 (GPIO 39, `REFRESH_BUTTON`) runs an immediate de-ghost instead and leaves the run going.
+  - The reseed cycle is a three-phase state machine (`RunPhase`: `RUN_ON_PANEL` / `RUN_LEAVING` / `RUN_ARRIVING`), driven entirely from `loop()`. There are no nested frame loops — `loop()` runs once per frame in every phase and `animate_frame()` is called from exactly one place. `update_motion()` reads `s_phase == RUN_ARRIVING` to know whether a suspended axis may reclaim its wall.
+  - Because `loop()` always runs, buttons are polled there once a frame and a refresh needs no latch. The only windows where a press is missed are the clears, which block inside the library.
+  - A run's figures are snapshotted into `s_run` when it ends and printed once the next cube has arrived, so the transit timings on the line belong to the transit that just happened. `s_run.pending` is false at boot, where there is an arrival but no run behind it to report.
 
 - **`libraries/EpdFast/`:** Custom driver wrapping LilyGo-EPD47's low-level API. Main entry point: `epd_push_diff(y0, rows, cur, prev, relight, dwell)`. Carries both `0b01` and `0b10` drive codes per pixel in a single waveform pass.
   - `epd_wipe(hold, dark_settle, light_settle, dwell)`: Bayer dissolve to black and back, then settling passes. The dissolve is 64 dither levels × hold passes per level; `hold=2` is ~5.2 s.
@@ -54,7 +57,9 @@ Pressing the refresh button logs its own line:
 refresh: <ms> ms at gen=<generation> live=<cell_count>
 ```
 
-- `fps` is *only* on-panel frames, excluding transit (exit + wipe + enter). Transit frames are discarded from the average.
+- `fps` is *only* on-panel frames, excluding transit (exit + wipe + enter). The counters are zeroed on every `RUN_ARRIVING` → `RUN_ON_PANEL` transition, boot's arrival included, so the first reported window is on-panel too. (Before the state machine, boot's ~9 s of drifting on landed in the first window and made its `fps` read high.)
+- `enter` takes one of two values, set by which axis has to come back into range: the cube always covers `BOUNCE_LO + OFFSTAGE` = 310.85 px to arrive, so a horizontal arrival is 310.85/34 = **9.1 s** and a vertical one is 310.85/16 = **19.4 s**. Measured 9.2 s and 19.5 s. Side arrivals dominate because the horizontal drift is twice the vertical. `exit` has no such figure — it depends where the cube was when the run ended (9.6–27.2 s observed).
+- `exit` and `enter` are wall clock across the transit phases, measured from `s_phase_t0`, so a refresh taken mid-transit is included in them. Deliberate — the figure is what the transit actually took.
 - `reason=button` means a button 1/2 press ended the run. Button 3 never ends a run; it logs a `refresh:` line instead.
 - Exit/enter/wipe times come from `millis()`, so they include measurement imprecision and animation overhead. Expect ±50 ms.
 
@@ -77,7 +82,7 @@ refresh: <ms> ms at gen=<generation> live=<cell_count>
 ## If something breaks
 
 - **Panel stays grey or blank after reseeding:** The clear either failed or the panel is in an inconsistent state. Try a manual `epd_clear()` call or a power cycle.
-- **Frame rate drops suddenly:** Check if `s_free_flight` got stuck in a transition; a timeout guard should catch it, but it's worth testing the exit/enter logic with a button press during different cube positions.
+- **Frame rate drops suddenly:** Check whether `s_phase` is stuck in `RUN_LEAVING` or `RUN_ARRIVING`. `TRANSIT_TIMEOUT_MS` (90 s, measured from `s_phase_t0`) is the backstop and forces the phase on, but a cube that never reaches `cube_offstage()` would sit there until it fires.
 - **Trails appear again:** The relight plane likely failed to allocate. Check the boot log for `warning: no room for the relight plane`. The animation is still correct; the trails will go away on the next reseed.
 - **Compiler errors on a fresh clone:** Confirm `--libraries libraries` is in the command. Without it, Arduino IDE won't find the vendored driver.
 

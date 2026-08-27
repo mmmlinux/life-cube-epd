@@ -561,9 +561,19 @@ static void present(void)
 // still mid-panel, and that axis has to keep bouncing normally or it will just
 // wander off again while the other one is arriving.
 static bool s_free_x = false, s_free_y = false;
-// While arriving, a suspended axis takes its wall back the moment it is in
-// range. While leaving, it never does.
-static bool s_arriving = false;
+
+// Where the sketch is in the reseed cycle. Every phase animates through the
+// same loop() at the same speed; the phase only decides whether the walls are
+// live and what has to happen when the cube reaches its mark. A suspended axis
+// takes its wall back the moment it is in range while arriving, and never while
+// leaving - which is the whole difference between the two transits.
+typedef enum {
+    RUN_ON_PANEL,   // walls live; Life's verdict or a button ends the run
+    RUN_LEAVING,    // walls off, drifting out of frame
+    RUN_ARRIVING,   // walls off until each axis comes back into range
+} RunPhase;
+
+static RunPhase s_phase = RUN_ON_PANEL;
 
 static const float BOUNCE_LO_X = CUBE_RADIUS + EDGE_MAX;
 static const float BOUNCE_HI_X = EPD_WIDTH  - CUBE_RADIUS - EDGE_MAX;
@@ -585,13 +595,13 @@ static void update_motion(float dt)
     // The cube is positioned by its centre and never projects further than
     // CUBE_RADIUS from it, so the bounce limits come straight from that.
     if (s_free_x) {
-        if (s_arriving && s_pos_x >= BOUNCE_LO_X && s_pos_x <= BOUNCE_HI_X) s_free_x = false;
+        if (s_phase == RUN_ARRIVING && s_pos_x >= BOUNCE_LO_X && s_pos_x <= BOUNCE_HI_X) s_free_x = false;
     } else {
         if (s_pos_x < BOUNCE_LO_X) { s_pos_x = BOUNCE_LO_X; s_vel_x = -s_vel_x; }
         if (s_pos_x > BOUNCE_HI_X) { s_pos_x = BOUNCE_HI_X; s_vel_x = -s_vel_x; }
     }
     if (s_free_y) {
-        if (s_arriving && s_pos_y >= BOUNCE_LO_Y && s_pos_y <= BOUNCE_HI_Y) s_free_y = false;
+        if (s_phase == RUN_ARRIVING && s_pos_y >= BOUNCE_LO_Y && s_pos_y <= BOUNCE_HI_Y) s_free_y = false;
     } else {
         if (s_pos_y < BOUNCE_LO_Y) { s_pos_y = BOUNCE_LO_Y; s_vel_y = -s_vel_y; }
         if (s_pos_y > BOUNCE_HI_Y) { s_pos_y = BOUNCE_HI_Y; s_vel_y = -s_vel_y; }
@@ -687,7 +697,10 @@ static void buttons_begin(void)
 
 // Bitmask of the usable buttons that went down on this poll, bit i for
 // BUTTON_PINS[i]. One bool could not tell the three apart, and they no longer
-// all mean the same thing.
+// all mean the same thing. Called once a frame from loop(), which runs in every
+// phase, so the only windows where a press can fall down the gap are the
+// clears: epd_wipe() and epd_deghost() block inside the library with no
+// callback.
 static uint32_t buttons_went_down(void)
 {
     uint32_t hits = 0;
@@ -775,7 +788,25 @@ static bool life_tick(void)
 // Only a backstop against a logic error; the drift always clears the panel.
 #define TRANSIT_TIMEOUT_MS (90000)
 
+// s_exit_ms and s_enter_ms are wall clock across the transit phases, so a
+// refresh taken mid-transit lands inside them. Left in rather than subtracted
+// out - the figure is what the transit actually took.
 static uint32_t s_wipe_ms = 0, s_exit_ms = 0, s_enter_ms = 0;
+
+// When the current phase began. Does both jobs: it is what the exit and enter
+// figures are measured from, and what TRANSIT_TIMEOUT_MS is checked against.
+static uint32_t s_phase_t0 = 0;
+
+// The finished run's figures, snapshotted the moment it ends and printed once
+// the next cube has arrived - so the line carries the transit timings that
+// belong to it rather than the previous one. `pending` is false at boot, where
+// there is an arrival but no run behind it to report.
+static struct {
+    uint32_t    gen, frames, render_us, push_us;
+    int         live;
+    const char *reason;
+    bool        pending;
+} s_run = { 0, 0, 0, 0, 0, "", false };
 
 static bool cube_offstage(void)
 {
@@ -788,19 +819,13 @@ static float clampf(float v, float lo, float hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Let go of the walls and carry on until the cube has left the panel.
-static void exit_stage(void)
+// Let go of the walls. From here the cube carries on exactly as it was, on the
+// heading it already had, until it has left the panel; loop() watches for that.
+static void begin_leaving(void)
 {
-    s_arriving = false;
     s_free_x = s_free_y = true;
-
-    const uint32_t t0 = millis();
-    const uint32_t give_up = millis() + TRANSIT_TIMEOUT_MS;
-    while (!cube_offstage() && (int32_t)(millis() - give_up) < 0) {
-        life_tick();        // the simulation keeps running on its way out
-        animate_frame();
-    }
-    s_exit_ms = millis() - t0;
+    s_phase = RUN_LEAVING;
+    s_phase_t0 = millis();
 }
 
 // Put the cube back on the far side, on the same heading at the same speed.
@@ -838,20 +863,11 @@ static void place_offstage(void)
 // Drift in from wherever the cube is sitting off-panel, running as normal.
 // update_motion() hands each axis its wall back as that axis comes into range;
 // the arrival is over once both have taken it.
-static void enter_stage(void)
+static void begin_arriving(void)
 {
-    s_arriving = true;
-    s_last_frame_us = 0;   // the wipe just ate five seconds of wall clock
-
-    const uint32_t t0 = millis();
-    const uint32_t give_up = millis() + TRANSIT_TIMEOUT_MS;
-    while ((s_free_x || s_free_y) && (int32_t)(millis() - give_up) < 0) {
-        life_tick();        // already running as it drifts on
-        animate_frame();
-    }
-    s_arriving = false;
-    s_free_x = s_free_y = false;
-    s_enter_ms = millis() - t0;
+    s_last_frame_us = 0;   // the clear just ate a chunk of wall clock
+    s_phase = RUN_ARRIVING;
+    s_phase_t0 = millis();
 }
 
 // `full` picks the black-and-back dissolve over the white-only flood. Reseeds
@@ -965,23 +981,36 @@ void setup(void)
     wipe_panel(true);   // whatever the last sketch left needs a real reset
     reset_life();
     place_offstage();
-    enter_stage();
+    begin_arriving();   // loop() drives it in from here
 }
 
 void loop(void)
 {
-    // Life still advances on its own clock whatever the buttons do. They only
-    // decide whether the panel gets a clean-up, or whether this run is over.
-    // refresh_now() zeroes s_last_frame_us and nothing between here and
-    // animate_frame() reads it, so the flash stays out of the cube's motion.
+    // Polled here rather than inside animate_frame(): loop() now runs every
+    // frame in every phase, so a refresh lands wherever it is asked for without
+    // needing a latch to carry it. refresh_now() zeroes s_last_frame_us and
+    // nothing between here and animate_frame() reads it, so the flash's half
+    // second stays out of the cube's motion.
     const uint32_t hits = buttons_went_down();
     if (hits & (1u << REFRESH_BUTTON)) {
         refresh_now();
     }
-    const bool forced = (hits & ~(1u << REFRESH_BUTTON)) != 0;
+
+    // Life advances on its own clock in every phase - it keeps stepping the
+    // whole way out and the whole way back in. Called before the verdict is
+    // read rather than short-circuited, so a forced reseed still takes the
+    // generation it was due.
     const bool finished = life_tick();
 
-    if (forced || finished) {
+    switch (s_phase) {
+    case RUN_ON_PANEL: {
+        // A reseed request only means something here. During a transit the
+        // cycle it would ask for is the one already playing, so it is ignored
+        // rather than queued to fire the moment the cube arrives.
+        const bool forced = (hits & ~(1u << REFRESH_BUTTON)) != 0;
+        if (!forced && !finished) {
+            break;
+        }
         if (forced) {
             // The button takes the label whatever Life was doing: the reseed
             // happened because someone asked for it.
@@ -994,31 +1023,58 @@ void loop(void)
         // empty, so present() returns immediately - and a transit is tens of
         // seconds of those frames. Averaging them in reports a frame rate the
         // animation never actually ran at.
-        const uint32_t gen = s_generation, frames = s_frames;
-        const uint32_t render_us = s_render_us, push_us = s_push_us;
-        const int live = s_last_live;
-        const char *reason = s_last_reason;
+        s_run.gen       = s_generation;  s_run.frames = s_frames;
+        s_run.render_us = s_render_us;   s_run.push_us = s_push_us;
+        s_run.live      = s_last_live;   s_run.reason = s_last_reason;
+        s_run.pending   = true;
 
-        exit_stage();       // carries on exactly as it was until it is off-panel
+        begin_leaving();
+        break;
+    }
+
+    case RUN_LEAVING:
+        if (!cube_offstage() && (int32_t)(millis() - s_phase_t0) < TRANSIT_TIMEOUT_MS) {
+            break;
+        }
+        s_exit_ms = millis() - s_phase_t0;
+
+        // Wiping an empty panel is the point: the clear no longer happens over
+        // the top of a cube, so it reads as scenery rather than as a fault.
         wipe_panel(!WHITE_ONLY_REFRESH);
         reset_life();
         wrap_to_far_side();
-        enter_stage();      // and drifts back on, already running
+        begin_arriving();
+        break;
 
-        // Logged after the sequence rather than before it, so the transit
-        // timings belong to the transit that just happened instead of the one
-        // before. Logged outside the frame loop either way: a line at 115200
-        // baud is milliseconds of blocking, a visible hitch at 20 fps.
-        Serial.printf("gen=%lu live=%d reason=%s | %lu frames, %.1f fps "
-                      "(render %.1f ms, push %.1f ms) | exit %.1fs wipe %.1fs enter %.1fs\n",
-                      (unsigned long)gen, live, reason, (unsigned long)frames,
-                      frames ? 1e6f * frames / (float)(render_us + push_us) : 0.0f,
-                      frames ? render_us / 1000.0f / frames : 0.0f,
-                      frames ? push_us / 1000.0f / frames : 0.0f,
-                      s_exit_ms / 1000.0f, s_wipe_ms / 1000.0f, s_enter_ms / 1000.0f);
+    case RUN_ARRIVING:
+        if ((s_free_x || s_free_y) && (int32_t)(millis() - s_phase_t0) < TRANSIT_TIMEOUT_MS) {
+            break;
+        }
+        s_free_x = s_free_y = false;   // the timeout backstop lands here too
+        s_enter_ms = millis() - s_phase_t0;
+        s_phase = RUN_ON_PANEL;
 
-        // Discard the transit's frames; the next window starts on-panel.
+        if (s_run.pending) {
+            // Logged once the cube is back rather than before it left, so the
+            // transit timings belong to the transit that just happened instead
+            // of the one before. Logged between frames either way: a line at
+            // 115200 baud is milliseconds of blocking, a visible hitch at 20 fps.
+            Serial.printf("gen=%lu live=%d reason=%s | %lu frames, %.1f fps "
+                          "(render %.1f ms, push %.1f ms) | exit %.1fs wipe %.1fs enter %.1fs\n",
+                          (unsigned long)s_run.gen, s_run.live, s_run.reason,
+                          (unsigned long)s_run.frames,
+                          s_run.frames ? 1e6f * s_run.frames / (float)(s_run.render_us + s_run.push_us) : 0.0f,
+                          s_run.frames ? s_run.render_us / 1000.0f / s_run.frames : 0.0f,
+                          s_run.frames ? s_run.push_us / 1000.0f / s_run.frames : 0.0f,
+                          s_exit_ms / 1000.0f, s_wipe_ms / 1000.0f, s_enter_ms / 1000.0f);
+            s_run.pending = false;
+        }
+
+        // Discard the transit's frames; the next window starts on-panel. Boot's
+        // arrival comes through here too, so the first window is on-panel as
+        // well - it used to carry the nine seconds of drifting on.
         s_frames = 0; s_render_us = 0; s_push_us = 0;
+        break;
     }
 
     animate_frame();
